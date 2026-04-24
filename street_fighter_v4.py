@@ -3,6 +3,7 @@
 Street Fighter — Gesture Edition (v4)
 Two players, one camera. Mana-based combat system.
 """
+from __future__ import annotations
 import os, sys, math, time, threading, random
 import cv2, mediapipe as mp, numpy as np, pygame
 from mediapipe.tasks import python as mp_python
@@ -24,20 +25,18 @@ HP_MAX         = 100
 MANA_MAX       = 100
 MANA_REGEN     = 10.0    # per second, only when idle (gesture == "none")
 ROUND_TIME     = 90
-GOJO_MAX_USES  = 4
+GOJO_MAX_USES  = 3
 CONFIRM_TIME   = 0.4     # seconds to hold gesture before move triggers
 FIRE_COOLDOWN  = 1.5
-SHIELD_COST    = 15      # mana upfront to activate shield
-SHIELD_REDUCE  = 0.5     # 50 % damage reduction
-HEAL_MANA_COST = 45
-HEAL_HP_GAIN   = 20
+SHIELD_COST    = 20      # mana upfront to activate shield
+SHIELD_REDUCE  = 0.4     # 60 % damage reduction
+MAX_ROUNDS     = 3
 
 # move → {damage, mana}
 ATTACK_MOVES = {
-    "gun":      {"damage": 12, "mana": 15},
-    "fireball": {"damage": 24, "mana": 40},
-    "gojo":     {"damage": 45, "mana": 85},
-    "heart":    {"damage":  4, "mana":  5},
+    "gun":      {"damage": 15, "mana": 20},
+    "gojo":     {"damage": 40, "mana": 80},
+    "heart":    {"damage":  5, "mana":  8},
 }
 
 COUNTDOWN_TOTAL = 5.5    # 5 s numbers + 0.5 s FIGHT!
@@ -53,7 +52,6 @@ C_HP_BG        = ( 35,   8,   8)
 C_MANA_FILL    = ( 50, 120, 255)
 C_MANA_BG      = ( 10,  20,  55)
 C_SHIELD       = ( 80, 210, 255)
-C_HEAL         = ( 70, 255, 120)
 C_GOLD         = (255, 215,   0)
 C_ORANGE       = (255, 140,   0)
 C_WHITE        = (255, 255, 255)
@@ -66,12 +64,11 @@ C_VOID_GLOW    = (160,  60, 255)
 
 ATTACK_COLORS = {
     "gun":      (255, 230,  50),
-    "fireball": (255, 110,   0),
     "gojo":     (160,  60, 255),
     "heart":    (255,  60, 160),
 }
 GESTURE_LABELS = {
-    "gun": "GUN", "fireball": "FIREBALL", "gojo": "GOJO", "heart": "♥",
+    "gun": "GUN", "gojo": "GOJO", "heart": "♥",
 }
 
 
@@ -106,6 +103,8 @@ class GestureReader:
         if result.gestures:
             top = result.gestures[0][0]
             g, s = top.category_name.lower(), top.score
+        if g in ("fireball", "heal"):
+            g, s = "none", 0.0
         with self._lock:
             self._gesture, self._score = g, s
 
@@ -145,7 +144,6 @@ class Player:
         self.fire_cd          = 0.0
         self.shield_active    = False
         self.shield_paid      = False  # mana already deducted this hold
-        self.healing          = False
 
         self.hit_flash        = 0.0
         self.hit_color        = C_HP_LOW
@@ -158,7 +156,7 @@ class Player:
         self.fire_cd = 0.0; self.hit_flash = 0.0; self.blocked_flash = 0.0
         self.last_fired = None; self.gesture_hold_t = 0.0
         self.prev_gesture = "none"
-        self.shield_active = False; self.shield_paid = False; self.healing = False
+        self.shield_active = False; self.shield_paid = False
 
     def update(self, gesture: str, confidence: float, dt: float):
         self.gesture    = gesture
@@ -193,16 +191,6 @@ class Player:
         else:
             self.shield_active = False
             self.shield_paid   = False
-
-        # Heal (instantaneous on confirm: +20 HP, costs 45 mana)
-        self.healing = False
-        if gesture == "heal" and self.fire_cd <= 0.0:
-            if self.gesture_hold_t >= CONFIRM_TIME and self.mana >= HEAL_MANA_COST:
-                self.mana          -= HEAL_MANA_COST
-                self.hp             = min(self.max_hp, self.hp + HEAL_HP_GAIN)
-                self.healing        = True
-                self.fire_cd        = FIRE_COOLDOWN
-                self.gesture_hold_t = 0.0
 
         # Attack moves (fire on confirm if enough mana)
         fired = None
@@ -272,7 +260,8 @@ class StreetFighterGame:
         self.p2 = Player(1)
         self._particles:     list[dict] = []
         self._atk_effects:   list[dict] = []
-        self.round_num = 1
+        self.round_num  = 1
+        self.match_msg  = ""
 
         self._cam_frames: list[np.ndarray | None] = [None, None]
         self._cam_lock = threading.Lock()
@@ -314,6 +303,14 @@ class StreetFighterGame:
         if winner == 0: self.p1.rounds_won += 1
         elif winner == 1: self.p2.rounds_won += 1
         self.round_num += 1
+        if self.round_num > MAX_ROUNDS:
+            self.phase = "match_end"
+            if self.p1.rounds_won > self.p2.rounds_won:
+                self.match_msg = "PLAYER 1 WINS THE MATCH!"
+            elif self.p2.rounds_won > self.p1.rounds_won:
+                self.match_msg = "PLAYER 2 WINS THE MATCH!"
+            else:
+                self.match_msg = "IT'S A TIE!"
 
     # ── attack resolution ─────────────────────────────────────────────────────
     def _resolve_attack(self, attacker: Player, defender: Player, gesture: str):
@@ -386,22 +383,38 @@ class StreetFighterGame:
         # ── P2 HP bar (fills right→left, drains from left) ────────────────────
         self._draw_sf_hp(surface, self.p2, hp_x2, hp_y, hp_w, hp_h, flip=True)
 
-        # ── Player names ───────────────────────────────────────────────────────
+        # ── Player names (below HP bar, each in their own half) ───────────────
         p1n = self._outlined(self.font_big, "PLAYER 1", C_P1)
         p2n = self._outlined(self.font_big, "PLAYER 2", C_P2)
-        surface.blit(p1n, (10, 4))
-        surface.blit(p2n, (SCREEN_W - p2n.get_width() - 10, 4))
+        name_y = hp_y + hp_h + 4
+        surface.blit(p1n, (hp_x1, name_y))
+        surface.blit(p2n, (hp_x2 + hp_w - p2n.get_width(), name_y))
 
-        # ── Gojo-use stars (below names) ───────────────────────────────────────
+        # ── Gojo-use boxes (square checkboxes, one per use) ───────────────────
+        BOX  = 26
+        GAP  = 6
+        gojo_y  = name_y + p1n.get_height() + 6
+        total_w = GOJO_MAX_USES * BOX + (GOJO_MAX_USES - 1) * GAP
         for player in (self.p1, self.p2):
-            rem   = GOJO_MAX_USES - player.gojo_uses
-            stars = "★" * rem + "☆" * player.gojo_uses
-            col   = C_VOID_GLOW if rem > 0 else C_GRAY
-            txt   = self.font_tiny.render(stars, True, col)
-            if player.player_id == 0:
-                surface.blit(txt, (12, HUD_TOP - txt.get_height() - 4))
-            else:
-                surface.blit(txt, (SCREEN_W - txt.get_width() - 12, HUD_TOP - txt.get_height() - 4))
+            start_x = hp_x1 if player.player_id == 0 \
+                      else hp_x2 + hp_w - total_w
+            for i in range(GOJO_MAX_USES):
+                bx   = start_x + i * (BOX + GAP)
+                by   = gojo_y
+                used = i < player.gojo_uses
+                # box background
+                bg_col = (55, 0, 90) if used else (20, 8, 38)
+                pygame.draw.rect(surface, bg_col, (bx, by, BOX, BOX))
+                # box border — bright when available, dimmed when used
+                bd_col = (140, 60, 200) if used else (210, 120, 255)
+                pygame.draw.rect(surface, bd_col, (bx, by, BOX, BOX), 2)
+                # X cross when used
+                if used:
+                    m = 5
+                    pygame.draw.line(surface, (230, 140, 255),
+                                     (bx+m, by+m), (bx+BOX-m, by+BOX-m), 3)
+                    pygame.draw.line(surface, (230, 140, 255),
+                                     (bx+BOX-m, by+m), (bx+m, by+BOX-m), 3)
 
         # ── Round + Timer (center) ─────────────────────────────────────────────
         rnd   = self._outlined(self.font_small, f"ROUND  {self.round_num}", C_GOLD)
@@ -412,10 +425,12 @@ class StreetFighterGame:
         timer = self._outlined(self.font_huge, str(ts), tcol)
         surface.blit(timer, (SCREEN_W//2 - timer.get_width()//2, 24))
 
-        # Score
-        sc = self.font_tiny.render(
-            f"{self.p1.rounds_won}  ●  {self.p2.rounds_won}", True, C_GRAY)
-        surface.blit(sc, (SCREEN_W//2 - sc.get_width()//2, HUD_TOP - sc.get_height() - 3))
+        # Score (below timer, bigger, dark outline for contrast)
+        sc = self._outlined(self.font_med,
+            f"{self.p1.rounds_won}  ●  {self.p2.rounds_won}",
+            C_WHITE, oc=(20, 10, 40), ow=2)
+        surface.blit(sc, (SCREEN_W//2 - sc.get_width()//2,
+                          timer.get_height() + 28))
 
     def _draw_sf_hp(self, surface, player, x, y, w, h, flip):
         ratio  = max(0.0, player.hp / player.max_hp)
@@ -459,9 +474,6 @@ class StreetFighterGame:
             can  = player.mana >= cost
             mana_str += f"   [-{cost}]"
             txt_col = C_WHITE if can else (255, 80, 80)
-        elif player.gesture == "heal":
-            mana_str += f"   [-{HEAL_MANA_COST}]"
-            txt_col = C_WHITE if player.mana >= HEAL_MANA_COST else (255, 80, 80)
         elif player.gesture == "shield":
             mana_str += f"   [-{SHIELD_COST}]"
             txt_col = C_WHITE
@@ -512,19 +524,11 @@ class StreetFighterGame:
             pygame.draw.circle(ss, (*C_SHIELD, 45),  (PANEL_W//2, cam_h//2), pr+14, 3)
             surface.blit(ss, (base_x, cam_y))
 
-        # Heal glow
-        if player.healing:
-            t = time.time()
-            a = int(55 + 35 * math.sin(t * 4))
-            sh = pygame.Surface((PANEL_W, cam_h), pygame.SRCALPHA)
-            pygame.draw.rect(sh, (*C_HEAL, a), (0, 0, PANEL_W, cam_h), 10)
-            surface.blit(sh, (base_x, cam_y))
-
         # Confirm-charge glow (brief pulse while holding a move before it fires)
-        if player.gesture in ATTACK_MOVES or player.gesture == "heal":
+        if player.gesture in ATTACK_MOVES:
             prog = min(1.0, player.gesture_hold_t / CONFIRM_TIME)
             if 0 < prog < 1.0:
-                col  = ATTACK_COLORS.get(player.gesture, C_HEAL)
+                col  = ATTACK_COLORS.get(player.gesture, C_WHITE)
                 t    = time.time()
                 a    = int(15 + 35 * prog * abs(math.sin(t * 8)))
                 sc   = pygame.Surface((PANEL_W, cam_h), pygame.SRCALPHA)
@@ -657,31 +661,32 @@ class StreetFighterGame:
                 pygame.draw.circle(os_, (255, 220, 255, oa//2), (nr*2, nr*2), nr//2)
                 surface.blit(os_, (ox - nr*2, oy - nr*2))
 
-        # "DOMAIN EXPANSION"
-        if 0.12 < ratio < 0.82:
-            da = a_ramp(ratio, 0.12, 0.22, 0, 255) if ratio < 0.22 else \
-                 a_ramp(ratio, 0.68, 0.82, 255, 0) if ratio > 0.68 else 255
-            dt = self._outlined(self.font_big, "DOMAIN EXPANSION", (210, 185, 255), ow=2)
-            dt.set_alpha(da)
-            surface.blit(dt, (cx - dt.get_width()//2,
-                               cy - int((SCREEN_H-HUD_TOP)*0.18)))
+        # "DOMAIN EXPANSION" and "INFINITE VOID" — same font, stacked, clamped
+        def _clamp_x(surf, panel_x):
+            return max(panel_x, min(panel_x + PANEL_W - surf.get_width(),
+                                    cx - surf.get_width() // 2))
 
-        # "INFINITE VOID"
+        if 0.12 < ratio < 0.82:
+            da  = a_ramp(ratio, 0.12, 0.22, 0, 255) if ratio < 0.22 else \
+                  a_ramp(ratio, 0.68, 0.82, 255, 0) if ratio > 0.68 else 255
+            de  = self._outlined(self.font_big, "DOMAIN EXPANSION",
+                                 (210, 185, 255), oc=(60, 0, 120), ow=2)
+            de.set_alpha(da)
+            de_y = cy - de.get_height() - 10
+            surface.blit(de, (_clamp_x(de, att_x), de_y))
+
         if 0.25 < ratio < 0.88:
             ia  = a_ramp(ratio, 0.25, 0.38, 0, 255) if ratio < 0.38 else \
                   a_ramp(ratio, 0.74, 0.88, 255, 0) if ratio > 0.74 else 255
-            sc  = 1.6 - 0.6 * min(1.0, (ratio-0.25)/0.13) if ratio < 0.38 else 1.0
-            ib  = self._outlined(self.font_giant, "INFINITE VOID", C_VOID_GLOW, ow=3)
-            iw, ih = ib.get_size()
-            nw, nh = max(1, int(iw*sc)), max(1, int(ih*sc))
-            is_ = pygame.transform.smoothscale(ib, (nw, nh))
-            # glow
-            gw, gh = nw+22, nh+22
-            gl  = pygame.transform.smoothscale(ib, (gw, gh))
-            gl.set_alpha(ia//2)
-            surface.blit(gl, (cx - gw//2, cy - gh//2 + int((SCREEN_H-HUD_TOP)*0.06)))
-            is_.set_alpha(ia)
-            surface.blit(is_, (cx - nw//2, cy - nh//2 + int((SCREEN_H-HUD_TOP)*0.06)))
+            iv      = self._outlined(self.font_big, "INFINITE VOID",
+                                     C_VOID_GLOW, oc=(40, 0, 100), ow=2)
+            iv_glow = self._outlined(self.font_big, "INFINITE VOID",
+                                     C_VOID_GLOW, oc=(40, 0, 100), ow=5)
+            iv_y = cy + 10
+            iv_glow.set_alpha(ia // 2)
+            surface.blit(iv_glow, (_clamp_x(iv_glow, att_x), iv_y))
+            iv.set_alpha(ia)
+            surface.blit(iv, (_clamp_x(iv, att_x), iv_y))
 
     # ── All attack effects ─────────────────────────────────────────────────────
     def _draw_atk_effects(self, surface):
@@ -765,6 +770,18 @@ class StreetFighterGame:
 
         self._atk_effects = alive
 
+    # ── Match-end overlay ─────────────────────────────────────────────────────
+    def _draw_match_end(self, surface):
+        ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
+        ov.fill((0, 0, 0, 200)); surface.blit(ov, (0, 0))
+        msg = self._outlined(self.font_huge, self.match_msg, C_GOLD, ow=3)
+        sc  = self.font_med.render(
+            f"Final Score  P1: {self.p1.rounds_won}   P2: {self.p2.rounds_won}", True, C_GRAY)
+        sub = self._outlined(self.font_big, "Press R to play again", C_WHITE)
+        surface.blit(msg, (SCREEN_W//2 - msg.get_width()//2, SCREEN_H//2 - 100))
+        surface.blit(sc,  (SCREEN_W//2 - sc.get_width()//2,  SCREEN_H//2))
+        surface.blit(sub, (SCREEN_W//2 - sub.get_width()//2, SCREEN_H//2 + 70))
+
     # ── Round-end overlay ─────────────────────────────────────────────────────
     def _draw_round_end(self, surface):
         ov = pygame.Surface((SCREEN_W, SCREEN_H), pygame.SRCALPHA)
@@ -788,7 +805,12 @@ class StreetFighterGame:
                 if event.type == pygame.QUIT: self._quit()
                 if event.type == pygame.KEYDOWN:
                     if event.key in (pygame.K_q, pygame.K_ESCAPE): self._quit()
-                    if event.key == pygame.K_r: self._new_round()
+                    if event.key == pygame.K_r:
+                        if self.phase == "match_end":
+                            self.p1.rounds_won = 0; self.p2.rounds_won = 0
+                            self.p1.gojo_uses  = 0; self.p2.gojo_uses  = 0
+                            self.round_num = 1
+                        self._new_round()
 
             g1, g2 = self.reader[0].gesture, self.reader[1].gesture
             s1, s2 = self.reader[0].score,   self.reader[1].score
@@ -809,9 +831,11 @@ class StreetFighterGame:
                     if   self.p1.hp > self.p2.hp: self._end_round("PLAYER 1 WINS! (Time)", 0)
                     elif self.p2.hp > self.p1.hp: self._end_round("PLAYER 2 WINS! (Time)", 1)
                     else: self._end_round("DRAW!")
-            else:
+            elif self.phase == "round_end":
                 time_left = 0
                 if time.time() >= self.round_end_t: self._new_round()
+            else:
+                time_left = 0
 
             # ── Render ────────────────────────────────────────────────────────
             cam1, cam2 = self._get_frames()
@@ -826,6 +850,8 @@ class StreetFighterGame:
                 self._draw_countdown(self.screen, time.time() - self.countdown_start)
             elif self.phase == "round_end":
                 self._draw_round_end(self.screen)
+            elif self.phase == "match_end":
+                self._draw_match_end(self.screen)
 
             pygame.display.flip()
 

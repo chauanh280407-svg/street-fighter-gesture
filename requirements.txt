@@ -1,2 +1,4 @@
+mediapipe>=0.10
 opencv-python
-mediapipe
+pygame>=2.0
+numpy
